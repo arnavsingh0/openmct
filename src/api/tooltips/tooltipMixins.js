@@ -20,42 +20,126 @@
  * at runtime from the About dialog for additional information.
  *****************************************************************************/
 
+const pathHoverComponents = new Set();
+
+function dismissPathHoverTooltips() {
+  pathHoverComponents.forEach((component) => {
+    component.hideToolTipOnModifierRelease();
+  });
+}
+
+function dismissPathHoverTooltipsForHiddenAnchors() {
+  pathHoverComponents.forEach((component) => {
+    component.hideToolTipIfAnchorHidden();
+  });
+}
+
+function onModifierKeyUp(event) {
+  if (event.key !== 'Control') {
+    return;
+  }
+
+  dismissPathHoverTooltips();
+}
+
+function ensurePathHoverDismissListeners() {
+  if (ensurePathHoverDismissListeners.installed === true) {
+    return;
+  }
+
+  document.addEventListener('keyup', onModifierKeyUp);
+  document.addEventListener('click', dismissPathHoverTooltipsForHiddenAnchors);
+  window.addEventListener('blur', dismissPathHoverTooltips);
+  ensurePathHoverDismissListeners.installed = true;
+}
+
+function isTooltipAnchorShown(element) {
+  if (!(element instanceof Element)) {
+    return false;
+  }
+
+  if (element.isConnected !== true) {
+    return false;
+  }
+
+  return element.getClientRects().length > 0;
+}
+
 const tooltipHelpers = {
+  mounted() {
+    ensurePathHoverDismissListeners();
+    pathHoverComponents.add(this);
+  },
+  beforeUnmount() {
+    pathHoverComponents.delete(this);
+    this.hideToolTip();
+  },
   methods: {
     async getTelemetryPathString(telemetryIdentifier) {
+      const requestId = this._beginPathHoverRequest();
       let telemetryPathString = '';
-      if (!this.domainObject?.identifier) {
-        return;
+
+      try {
+        if (!this.domainObject?.identifier) {
+          return telemetryPathString;
+        }
+
+        const telemetryPath = await this.openmct.objects.getTelemetryPath(
+          this.domainObject.identifier,
+          telemetryIdentifier
+        );
+
+        if (telemetryPath.length) {
+          telemetryPathString = telemetryPath.join(' / ');
+        }
+      } finally {
+        this._tooltipResolvedRequestId = requestId;
       }
-      const telemetryPath = await this.openmct.objects.getTelemetryPath(
-        this.domainObject.identifier,
-        telemetryIdentifier
-      );
-      if (telemetryPath.length) {
-        telemetryPathString = telemetryPath.join(' / ');
-      }
+
       return telemetryPathString;
     },
     async getObjectPath(objectIdentifier) {
-      if (!objectIdentifier && !this.domainObject) {
-        return;
+      const requestId = this._beginPathHoverRequest();
+      let objectPath;
+
+      try {
+        if (!objectIdentifier && !this.domainObject) {
+          return objectPath;
+        }
+
+        const domainObjectIdentifier = objectIdentifier || this.domainObject.identifier;
+        const objectPathList = await this.openmct.objects.getOriginalPath(domainObjectIdentifier);
+
+        objectPathList.pop();
+        objectPath = objectPathList
+          .map((pathItem) => pathItem.name)
+          .reverse()
+          .join(' / ');
+      } finally {
+        this._tooltipResolvedRequestId = requestId;
       }
-      const domainObjectIdentifier = objectIdentifier || this.domainObject.identifier;
-      const objectPathList = await this.openmct.objects.getOriginalPath(domainObjectIdentifier);
-      objectPathList.pop();
-      return objectPathList
-        .map((pathItem) => pathItem.name)
-        .reverse()
-        .join(' / ');
+
+      return objectPath;
     },
     buildToolTip(tooltipText, tooltipLocation, elementRef, cssClasses) {
-      if (!tooltipText || tooltipText.length < 1) {
+      // The path is loaded asynchronously. If the pointer left, Control was
+      // released, or the anchor was hidden while that lookup was in flight,
+      // showing the tooltip now would leave it stuck on document.body.
+      if (!tooltipText || tooltipText.length < 1 || this._isPathHoverRequestCurrent() !== true) {
         return;
       }
+
       let parentElement = this.$refs[elementRef];
+
       if (Array.isArray(parentElement)) {
         parentElement = parentElement[0];
       }
+
+      if (isTooltipAnchorShown(parentElement) !== true) {
+        return;
+      }
+
+      this._tooltipAnchor = parentElement;
       this.tooltip = this.openmct.tooltips.tooltip({
         toolTipText: tooltipText,
         toolTipLocation: tooltipLocation,
@@ -64,8 +148,47 @@ const tooltipHelpers = {
       });
     },
     hideToolTip() {
-      this.tooltip?.destroy();
-      this.tooltip = null;
+      this._invalidatePathHoverRequest();
+      this._tooltipAnchor = null;
+
+      if (this.tooltip) {
+        this.tooltip.destroy();
+        this.tooltip = null;
+      }
+    },
+    hideToolTipOnModifierRelease() {
+      if (this._pathHoverRequestActive !== true) {
+        return;
+      }
+
+      this.hideToolTip();
+    },
+    hideToolTipIfAnchorHidden() {
+      if (!this.tooltip) {
+        return;
+      }
+
+      if (isTooltipAnchorShown(this._tooltipAnchor) === true) {
+        return;
+      }
+
+      this.hideToolTip();
+    },
+    _beginPathHoverRequest() {
+      this._pathHoverRequestActive = true;
+      this._tooltipRequestId = (this._tooltipRequestId || 0) + 1;
+
+      return this._tooltipRequestId;
+    },
+    _invalidatePathHoverRequest() {
+      this._tooltipRequestId = (this._tooltipRequestId || 0) + 1;
+    },
+    _isPathHoverRequestCurrent() {
+      if (this._tooltipResolvedRequestId === undefined) {
+        return true;
+      }
+
+      return this._tooltipResolvedRequestId === this._tooltipRequestId;
     }
   }
 };
